@@ -146,8 +146,11 @@ public final class ExcelSchema {
             case "DECIMAL":   return XO_TYPE_DECIMAL;
 
             case "CHAR":
+            				  return XO_TYPE_CHAR;
             case "VARCHAR":
-            case "LONGVARCHAR": return XO_TYPE_CHAR;
+            				  return XO_TYPE_VARCHAR;
+            case "LONGVARCHAR": 
+            				  return XO_TYPE_LONGVARCHAR;
 
             case "WCHAR":
             case "WVARCHAR":
