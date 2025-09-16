@@ -32,6 +32,14 @@ public final class ExcelHelper {
 
     private Workbook workbook;
     private File     file;
+    
+ // at class level
+    private volatile boolean dirty = false;
+
+    private void markDirty() { dirty = true; }
+    public boolean isDirty() { return dirty; }
+    private void clearDirty() { dirty = false; }
+
 
     public ExcelHelper(String excelPath, long tmHandle) throws ExcelInitException {
         this.excelPath = excelPath;
@@ -73,7 +81,12 @@ public final class ExcelHelper {
                     "Failed at new XSSFWorkbook(): " + e.getClass().getSimpleName() +
                     " -> " + safeMsg(e) + "\nClasspath:\n" + cp);
             }
-            saveWorkbook(); // persist immediately so later reloads work
+            try {
+				saveWorkbook();
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} // persist immediately so later reloads work
             return;
         }
 
@@ -98,6 +111,7 @@ public final class ExcelHelper {
         }
     }
 
+    
     // --------------------------- Sheet & row ops -----------------------------
 
     public synchronized boolean createSheet(String sheetName, java.util.List<String> headers) {
@@ -109,16 +123,35 @@ public final class ExcelHelper {
             cell.setCellValue(headers.get(i));
             sheet.autoSizeColumn(i);
         }
+        markDirty();
         return true;
     }
 
-    public synchronized boolean deleteSheet(String sheetName) {
+ // CHANGED
+    public boolean deleteSheet(String sheetName) {
         int idx = workbook.getSheetIndex(sheetName);
         if (idx < 0) return false;
+
+        // If this is the only sheet, refuse to drop so we don't create a zero-sheet workbook.
+        if (workbook.getNumberOfSheets() == 1) {
+            // leave the workbook intact; caller will report a drop failure
+            return false;
+        }
+
         workbook.removeSheetAt(idx);
+        markDirty();
         return true;
     }
 
+ // NEW helper
+    private static int findAppendRowIndex(org.apache.poi.ss.usermodel.Sheet sh) {
+        int last = sh.getLastRowNum();
+        // walk back over any null rows at the end
+        while (last >= 0 && sh.getRow(last) == null) last--;
+        return Math.max(0, last + 1);
+    }
+
+    
     public synchronized int getRowCount(String sheetName) {
         Sheet sheet = workbook.getSheet(sheetName);
         if (sheet == null) return 0;
@@ -149,13 +182,20 @@ public final class ExcelHelper {
         return rd;
     }
 
-    public synchronized int addEmptyRow(String sheetName) {
-        Sheet sheet = workbook.getSheet(sheetName);
-        if (sheet == null) return -1;
-        int newPhysIndex = sheet.getLastRowNum() + 1;
-        if (newPhysIndex < 1) newPhysIndex = 1; // ensure after header
-        sheet.createRow(newPhysIndex);
-        return newPhysIndex - 1; // logical index
+ // CHANGED
+    public int addEmptyRow(String sheetName) {
+        org.apache.poi.ss.usermodel.Sheet sh = workbook.getSheet(sheetName);
+        if (sh == null) return -1;
+
+        // Next logical index equals current data row count (excludes header at 0)
+        int logicalIdx = getRowCount(sheetName);
+        int physRow = logicalIdx + 1; // map logical -> physical
+
+        org.apache.poi.ss.usermodel.Row row = sh.getRow(physRow);
+        if (row == null) row = sh.createRow(physRow);
+
+        markDirty();
+        return logicalIdx; // return logical index, expected by caller
     }
 
     public synchronized void setCell(String sheetName, int dataRowIndex, ColumnMeta colMeta, Object value) {
@@ -211,6 +251,7 @@ public final class ExcelHelper {
             default:
                 cell.setCellValue(String.valueOf(value));
         }
+        markDirty();
     }
 
     public synchronized void deleteRow(String sheetName, int dataRowIndex) {
@@ -222,16 +263,47 @@ public final class ExcelHelper {
             sheet.removeRow(sheet.getRow(physRow));
             if (physRow < lastRow) sheet.shiftRows(physRow + 1, lastRow, -1, true, true);
         }
+        markDirty();
     }
 
-    public synchronized void saveWorkbook() {
-        try (FileOutputStream out = new FileOutputStream(file)) {
-            workbook.write(out);
+ // CHANGED
+    public synchronized void saveWorkbook() throws IOException {
+        if (workbook == null) return;
+
+        final java.nio.file.Path target = file.toPath();
+        final java.nio.file.Path dir    = target.getParent();
+        final java.nio.file.Path tmp    = java.nio.file.Files.createTempFile(
+                dir, target.getFileName().toString(), ".tmp");
+
+        boolean moved = false;
+        try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(
+                tmp,
+                java.nio.file.StandardOpenOption.WRITE,
+                java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+            workbook.write(out);   // if this throws, original is untouched
             out.flush();
-        } catch (IOException ioe) {
-            jdam.trace(tmHandle, UL_TM_ERRORS, "Failed to save workbook: " + ioe + "\n");
+
+            try {
+                java.nio.file.Files.move(
+                    tmp, target,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE
+                );
+                moved = true;
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                java.nio.file.Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                moved = true;
+            }
+        } finally {
+            // If move failed or anything threw after createTempFile, clean it up.
+            if (!moved) {
+                try { java.nio.file.Files.deleteIfExists(tmp); } catch (Exception ignore) {}
+            }
         }
+        clearDirty();
     }
+
+
 
     public synchronized void reloadWorkbook() {
         try {
@@ -291,7 +363,12 @@ public final class ExcelHelper {
                 "Failed at new XSSFWorkbook() during reinit: " + e.getClass().getSimpleName() +
                 " -> " + safeMsg(e) + "\nClasspath:\n" + cp);
         }
-        saveWorkbook(); // overwrite the bad file with a valid empty .xlsx
+        try {
+			saveWorkbook();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		} // overwrite the bad file with a valid empty .xlsx
     }
 
     private static String safeMsg(Throwable t) {

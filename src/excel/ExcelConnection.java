@@ -21,7 +21,22 @@ public final class ExcelConnection {
         this.schema = new ExcelSchema(excelFilePath + ".schema", tmHandle);
     }
 
-    public void save()   { excelHelper.saveWorkbook(); schema.save(); }
+    public void save() {
+        try {
+            // Save workbook only if changed (ExcelHelper tracks this)
+            if (excelHelper != null && excelHelper.isDirty()) {
+                excelHelper.saveWorkbook();   // safe & atomic now
+            }
+
+            // Schema files are small/plain text; safe to save unconditionally.
+            if (schema != null) {
+                schema.save();
+            }
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("Failed to save workbook/schema", e);
+        }
+    }
+
     public void reload() { excelHelper.reloadWorkbook(); schema.reload(); }
     public void close()  { excelHelper.closeWorkbook(); }
 }
