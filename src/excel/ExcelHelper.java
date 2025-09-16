@@ -92,23 +92,115 @@ public final class ExcelHelper {
 
         // (B) Try to open existing workbook; on format issues, back up and re-init a new workbook
         try {
-            this.workbook = WorkbookFactory.create(file);     // <-- same as your smoke test
-            jdam.trace(tmHandle, UL_TM_INFO, "Opened existing workbook: " + excelPath + "\n");
+        	// Relax POI zip safety to avoid false positives after Excel save
+        	org.apache.poi.openxml4j.util.ZipSecureFile.setMinInflateRatio(0.0d);
+        	org.apache.poi.openxml4j.util.ZipSecureFile.setMaxEntrySize(Long.MAX_VALUE);
+        	org.apache.poi.openxml4j.util.ZipSecureFile.setMaxTextSize(Long.MAX_VALUE);
+        	org.apache.poi.openxml4j.util.ZipSecureFile.setMaxFileCount(Integer.MAX_VALUE);
+        	org.apache.poi.openxml4j.util.ZipSecureFile.setMaxTextSize(Long.MAX_VALUE);
+
+        	// Try to open (with small retry), no temp copies, full read–write
+        	this.workbook = openWorkbookWithRetry(file, /*attempts*/3, /*sleepMs*/150);
+        	jdam.trace(tmHandle, UL_TM_INFO, "Opened existing workbook: " + excelPath + "\n");
+
         } catch (IllegalArgumentException iae) {
             backupAndReinit("Failed to parse as XLSX: " + iae.getMessage());
         } catch (EncryptedDocumentException ede) {
             throw new ExcelInitException(22,
                 "Excel file is password-protected: " + excelPath + ". Decrypt it before use.");
-        } catch (IOException ioe) {
-            throw new ExcelInitException(24,
-                "Cannot open Excel file: " + excelPath + " (" + ioe.getClass().getSimpleName() + ": " + ioe.getMessage() + "). " +
-                "Check file locks/permissions.");
         } catch (Exception e) {
             String cp = System.getProperty("java.class.path", "");
             throw new ExcelInitException(28,
                 "Failed while opening workbook: " + e.getClass().getSimpleName() +
                 " -> " + safeMsg(e) + "\nClasspath:\n" + cp);
         }
+    }
+
+    private Workbook openWorkbookWithRetry(File f, int attempts, int sleepMs) throws ExcelInitException {
+        int tryNo = 0;
+        Throwable last = null;
+        while (tryNo < attempts) {
+            tryNo++;
+            try {
+                // readOnly=false so we can still write later
+                return org.apache.poi.ss.usermodel.WorkbookFactory.create(f); 
+            } catch (org.apache.poi.EncryptedDocumentException e) {
+                jdam.trace(tmHandle, UL_TM_F_TRACE, "[Excel open] EncryptedDocumentException: " + safeMsg(e) + "\n");
+                traceOpenDiagnostics(f);
+                throw new ExcelInitException(22, "Workbook is encrypted; passwords not supported.");
+            } catch (IllegalArgumentException e) {
+                // POI uses this for “not OOXML / malformed zip”
+                jdam.trace(tmHandle, UL_TM_F_TRACE, "[Excel open] IllegalArgumentException: " + safeMsg(e) + classifyHint(e) + "\n");
+                traceOpenDiagnostics(f);
+                last = e;
+            } catch (java.io.IOException e) {
+                // often sharing/AV glitches; retry can help
+                jdam.trace(tmHandle, UL_TM_F_TRACE, "[Excel open] IOException: " + safeMsg(e) + classifyHint(e) + "\n");
+                traceOpenDiagnostics(f);
+                last = e;
+            } catch (Throwable e) {
+                jdam.trace(tmHandle, UL_TM_F_TRACE, "[Excel open] " + e.getClass().getSimpleName() + ": " + safeMsg(e) + "\n");
+                traceOpenDiagnostics(f);
+                last = e;
+            }
+
+            // small backoff before retry
+            if (tryNo < attempts) {
+                try { Thread.sleep(sleepMs * tryNo); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+        }
+        // Exhausted retries: fail with a precise, actionable message
+        String root = (last == null ? "Unknown" : last.getClass().getSimpleName() + ": " + safeMsg(last));
+        throw new ExcelInitException(24, "Cannot open workbook: " + root + classifyHint(last));
+    }
+
+    private String classifyHint(Throwable t) {
+        if (t == null) return "";
+        String msg = safeMsg(t).toLowerCase(java.util.Locale.ROOT);
+
+        // Strict OOXML / schema needs
+        if (msg.contains("strict") || msg.contains("purl.oclc.org/ooxml") || msg.contains("contenttype")) {
+            return " [hint: Strict Open XML; ensure 'poi-ooxml-full' (or matching 'ooxml-schemas') is on the classpath]";
+        }
+        // Zip-bomb/safety triggers
+        if (msg.contains("zip bomb") || msg.contains("inflate") || msg.contains("entry size") || msg.contains("text size")) {
+            return " [hint: POI zip-safety blocked open; limits have been relaxed above]";
+        }
+        // Common Windows sharing/AV messages
+        if (msg.contains("being used by another process") || msg.contains("cannot access the file")
+            || msg.contains("access is denied") || msg.contains("sharing violation")) {
+            return " [hint: file may be locked by another process; ensure Excel/AV is done with it]";
+        }
+        // Not a zip / malformed zip
+        if (msg.contains("not a zip") || msg.contains("not ooxml") || msg.contains("central directory")) {
+            return " [hint: file does not look like a valid .xlsx; re-save as .xlsx]";
+        }
+        return "";
+    }
+
+    private void traceOpenDiagnostics(File f) {
+        try {
+            jdam.trace(tmHandle, UL_TM_F_TRACE,
+                "[Excel diagnostics] exists=" + f.exists() +
+                " len=" + (f.exists() ? f.length() : -1) +
+                " canRead=" + f.canRead() +
+                " canWrite=" + f.canWrite() +
+                " lastModified=" + (f.exists() ? new java.util.Date(f.lastModified()) : null) +
+                " path=" + f.getAbsolutePath() + "\n");
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(f)) {
+                jdam.trace(tmHandle, UL_TM_F_TRACE, "[Excel diagnostics] zip ok; entries=" + zf.size() + "\n");
+            } catch (java.util.zip.ZipException ze) {
+                jdam.trace(tmHandle, UL_TM_F_TRACE, "[Excel diagnostics] zip check failed: " + safeMsg(ze) + "\n");
+            }
+            boolean hasFull = hasClass("org.apache.poi.ooxml.schemas.CTWorkbook");
+            boolean hasXmlb = hasClass("org.apache.xmlbeans.XmlObject");
+            jdam.trace(tmHandle, UL_TM_F_TRACE, "[Excel diagnostics] deps: poi-ooxml-full=" + hasFull + " xmlbeans=" + hasXmlb + "\n");
+        } catch (Throwable ignore) {}
+    }
+
+    private static boolean hasClass(String fqcn) {
+        try { Class.forName(fqcn, false, Thread.currentThread().getContextClassLoader()); return true; }
+        catch (Throwable t) { return false; }
     }
 
     
